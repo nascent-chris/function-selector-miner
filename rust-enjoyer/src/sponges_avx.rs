@@ -94,11 +94,7 @@ impl SpongesAvx {
     /// # Safety
     ///
     /// This function is unsafe because it uses SIMD instructions and a union type.
-    pub unsafe fn new(
-        function_name: &SmallString,
-        nonce: u64,
-        function_params: &SmallString,
-    ) -> Self {
+    pub fn new(function_name: &SmallString, nonce: u64, function_params: &SmallString) -> Self {
         let mut sponges = <[Sponge; 4]>::default();
         sponges.iter_mut().enumerate().for_each(|(idx, sponge)| {
             sponge.fill(function_name, nonce + idx as u64, function_params)
@@ -108,7 +104,7 @@ impl SpongesAvx {
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24,
         ]
-        .map(|idx| {
+        .map(|idx| unsafe {
             SpongeComputeSlice(_mm256_set_epi64x(
                 sponges[3].uint64s[idx] as i64,
                 sponges[2].uint64s[idx] as i64,
@@ -123,17 +119,19 @@ impl SpongesAvx {
     /// # Safety
     ///
     /// This function is unsafe because it uses SIMD instructions and a union type.
-    pub unsafe fn compute_selectors(&mut self) -> [u32; 4] {
+    pub fn compute_selectors(&mut self) -> [u32; 4] {
         crate::iters(&mut self.compute_slices);
 
         let first_slice = self.compute_slices[0].0;
 
-        [
-            _mm256_extract_epi64(first_slice, 0) as u32,
-            _mm256_extract_epi64(first_slice, 1) as u32,
-            _mm256_extract_epi64(first_slice, 2) as u32,
-            _mm256_extract_epi64(first_slice, 3) as u32,
-        ]
+        unsafe {
+            [
+                _mm256_extract_epi64(first_slice, 0) as u32,
+                _mm256_extract_epi64(first_slice, 1) as u32,
+                _mm256_extract_epi64(first_slice, 2) as u32,
+                _mm256_extract_epi64(first_slice, 3) as u32,
+            ]
+        }
     }
 }
 
@@ -195,4 +193,71 @@ fn ops() {
     println!("t: {t:X?}");
     let expected = crate::rotate_left(expected, 4);
     assert_eq!(t.vals()[0], expected);
+}
+
+#[test]
+fn verify_highly_parallel() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let function_name = SmallString::new("foo");
+    let function_params = SmallString::new("foo");
+    let c_expected = 0x0;
+
+    const STEP: usize = 4;
+    let num_threads = 128;
+    let end = 0xfffffffff0000000usize;
+    let go = AtomicBool::new(true);
+
+    let selector = 0;
+
+    (0..num_threads).into_par_iter().for_each(|thread_idx| {
+        for (idx, nonce) in ((thread_idx * STEP)..end)
+            .enumerate()
+            .step_by(STEP * num_threads)
+        {
+            if !go.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // let nonce = nonce + (thread_idx * STEP);
+
+            let mut sponges = SpongesAvx::new(&function_name, nonce as u64, &function_params);
+
+            let selectors = sponges.compute_selectors();
+
+            let maybe_idx = selectors.iter().position(|&x| x == selector);
+
+            if nonce == 0xc4de884 {
+                println!("selectors: {selectors:X?}");
+                assert_eq!(selectors[1], c_expected);
+            }
+
+            if nonce > 0xc4de884 {
+                println!("stopping, went over {nonce:#10x?}");
+                break;
+            }
+
+            // Progress logging for thread 0
+            if thread_idx == 0 && idx & 0x1fffff == 0 {
+                // println!("{num_hashes:?} hashes done.", num_hashes = nonce);
+            }
+
+            let Some(found_idx) = maybe_idx else {
+                continue;
+            };
+
+            // we found a match
+            let out = Sponge::default().fill_and_get_name(
+                &function_name,
+                (nonce + found_idx) as u64,
+                &function_params,
+            );
+            println!("Function found: {out} {nonce:#10x?}");
+
+            go.store(false, Ordering::Relaxed);
+        }
+    });
+
+    assert_eq!(go.load(Ordering::Relaxed), false);
 }

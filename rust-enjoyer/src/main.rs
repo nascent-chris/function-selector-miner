@@ -1,3 +1,5 @@
+use rayon::yield_now;
+use rayon::ThreadPoolBuilder;
 #[cfg(target_feature = "avx2")]
 use rust_enjoyer::sponges_avx::SpongesAvx;
 
@@ -58,8 +60,14 @@ fn main() {
     #[cfg(not(target_feature = "avx2"))]
     const STEP: usize = 1;
 
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .expect("Failed to create thread pool");
+
     println!("Starting mining with {num_threads} threads.");
 
+    // pool.install(|| {
     (0..num_threads).into_par_iter().for_each(|thread_idx| {
         for (idx, nonce) in (thread_idx * STEP..end)
             .step_by(num_threads * STEP)
@@ -85,37 +93,56 @@ fn main() {
             }
             #[cfg(target_feature = "avx2")]
             {
-                let mut sponges =
-                    unsafe { SpongesAvx::new(&function_name, nonce as u64, &function_params) };
+                let mut sponges = SpongesAvx::new(&function_name, nonce as u64, &function_params);
 
-                let maybe_idx = unsafe {
-                    sponges
-                        .compute_selectors()
-                        .iter()
-                        .position(|&x| x == selector)
-                };
+                let maybe_idx = sponges
+                    .compute_selectors()
+                    .iter()
+                    .position(|&x| x == selector);
+
+                // if nonce == 0xc4de884 {
+                //     println!("thread {thread_idx} should have stopped!!!!");
+                // }
 
                 // Progress logging for thread 0
-                if thread_idx == 0 && idx & 0x1fffff == 0 {
-                    println!("{num_hashes:?} hashes done.", num_hashes = nonce);
+                if idx & 0x1fffff == 0 {
+                    if thread_idx == 0 {
+                        println!("{num_hashes:?} hashes done.", num_hashes = nonce);
+                    }
+
+                    if thread_idx == 33 {
+                        println!(
+                            "thread {thread_idx} {nonce:#10x?} {over}",
+                            nonce = nonce,
+                            thread_idx = thread_idx,
+                            over = nonce > 0xc4de884
+                        );
+                    }
                 }
+
+                // if idx & 0xFF == 0 {}
+                // yield_now();
+
+                // if nonce > 0xc4de884 {
+                //     println!("thread {thread_idx} stopping, went over {nonce:#10x?}");
+                //     break;
+                // }
 
                 let Some(found_idx) = maybe_idx else {
                     continue;
                 };
 
                 // we found a match
-                let out = unsafe {
-                    Sponge::default().fill_and_get_name(
-                        &function_name,
-                        (nonce + found_idx) as u64,
-                        &function_params,
-                    )
-                };
-                println!("Function found: {out}");
+                let out = Sponge::default().fill_and_get_name(
+                    &function_name,
+                    (nonce + found_idx) as u64,
+                    &function_params,
+                );
+                println!("thread {thread_idx} Function found: {out}");
 
-                go.store(false, Ordering::Relaxed);
+                go.store(false, Ordering::SeqCst);
             }
         }
-    });
+    })
+    // });
 }
